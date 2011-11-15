@@ -9,7 +9,7 @@ LDFLAGS		:= -lbuse -lssl -L$(HOME)/src/BUSE
 all: $(TARGET)
 
 $(TARGET): %: %.o
-	$(CC) $(LDFLAGS) -o $@ $<
+	$(CC) -o $@ $< $(LDFLAGS)
 
 $(TARGET:=.o): %.o: %.c
 	$(CC) $(CFLAGS) -o $@ -c $<

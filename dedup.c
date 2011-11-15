@@ -57,6 +57,8 @@
             (i)*BLOCK_SIZE + j, SEEK_SET); \
     } while(0)
 
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
+
 struct hash_index_entry {
     char hash[FINGERPRINT_SIZE];
     uint64_t hash_log_address;
@@ -242,29 +244,86 @@ static int init()
     return 0;
 }
 
-static int dedup_write(const void *buf, uint32_t len, uint64_t offset)
+static int decrement_refcount()
 {
-    (void) buf;
-    (void) len;
-    (void) offset;
+    /* FIXME */
     return 0;
 }
 
-static int dedup_read(void *buf, uint32_t len, uint64_t offset)
+/* Write an extent that is guaranteed to lie within a single virtual (and
+ * physical) block. */
+static int write_one_block(const void *buf, uint32_t len, uint64_t offset)
+{
+    (void) buf;
+
+    int err;
+    char fingerprint[FINGERPRINT_SIZE];
+    uint64_t vbn = offset / BLOCK_SIZE;
+
+    /* FIXME: Need to be able to handle sub-block extents, too. */
+    assert(len == BLOCK_SIZE);
+
+    SEEK_TO_BLOCK_MAP(fd, vbn);
+    err = read(fd, fingerprint, FINGERPRINT_SIZE);
+    assert(err == FINGERPRINT_SIZE);
+
+    if (!fingerprint_is_zero(fingerprint)) {
+        /* We need to decrement the refcount for the old fingerprint. */
+        decrement_refcount(fingerprint);
+    }
+
+    /* ... more complicated logic needed here for when we deal with non-block
+     * extents... */
+
+    /* Compute the fingerprint of the new block. */
+    SHA1(buf, BLOCK_SIZE, (unsigned char *) fingerprint);
+
+    return 0;
+}
+
+static int dedup_write(const void *buf, uint32_t len, uint64_t offset)
+{
+    const char *bufi = buf;
+    uint32_t displacement = offset % BLOCK_SIZE;
+
+    /* If we don't begin on a block boundary, handle that case separately. */
+    if (displacement != 0) {
+        uint32_t write_size = MIN(len, BLOCK_SIZE - displacement);
+        write_one_block(bufi, write_size, offset);
+        bufi += write_size;
+        len -= write_size;
+        offset += write_size;
+    }
+    /* Now handle the full blocks. */
+    while (len > BLOCK_SIZE) {
+        assert(offset % BLOCK_SIZE == 0);
+        write_one_block(bufi, BLOCK_SIZE, offset);
+        bufi += BLOCK_SIZE;
+        len -= BLOCK_SIZE;
+        offset += BLOCK_SIZE;
+    }
+    /* Finally, handle the case where we don't end on a block boundary. */
+    if (len != 0)
+        write_one_block(bufi, len, offset);
+
+    return 0;
+}
+
+/* Read an extent that is guaranteed to lie within a single virtual (and
+ * physical) block. */
+static int read_one_block(void *buf, uint32_t len, uint64_t offset)
 {
     int err;
     char fingerprint[FINGERPRINT_SIZE];
-
     uint64_t vbn = offset / BLOCK_SIZE;
     SEEK_TO_BLOCK_MAP(fd, vbn);
     err = read(fd, fingerprint, FINGERPRINT_SIZE);
     assert(err == FINGERPRINT_SIZE);
 
     if (fingerprint_is_zero(fingerprint)) {
-        fprintf(stderr, "This virtual block has not yet been used.\n");
         /* Fill this virtual block with zeros. */
         dedup_write(zeros, BLOCK_SIZE, vbn);
-        memset(buf, len, 0);
+        memset(buf, 0, len);
         return len;
     }
 
@@ -280,10 +339,36 @@ static int dedup_read(void *buf, uint32_t len, uint64_t offset)
 
     SEEK_TO_DATA_LOG(fd, h.pbn, offset % BLOCK_SIZE);
     err = read(fd, buf, len);
-    /* FIXME: this won't work properly if the requested data spans more than one
-     * block. */
 
-    return len;
+    return 0;
+}
+
+static int dedup_read(void *buf, uint32_t len, uint64_t offset)
+{
+    char *bufi = buf;
+    uint32_t displacement = offset % BLOCK_SIZE;
+
+    /* If we don't begin on a block boundary, handle that case separately. */
+    if (displacement != 0) {
+        uint32_t read_size = MIN(len, BLOCK_SIZE - displacement);
+        read_one_block(bufi, read_size, offset);
+        bufi += read_size;
+        len -= read_size;
+        offset += read_size;
+    }
+    /* Now handle the full blocks. */
+    while (len > BLOCK_SIZE) {
+        assert(offset % BLOCK_SIZE == 0);
+        read_one_block(bufi, BLOCK_SIZE, offset);
+        bufi += BLOCK_SIZE;
+        len -= BLOCK_SIZE;
+        offset += BLOCK_SIZE;
+    }
+    /* Finally, handle the case where we don't end on a block boundary. */
+    if (len != 0)
+        read_one_block(bufi, len, offset);
+
+    return 0;
 }
 
 static int dedup_disc()
@@ -306,7 +391,6 @@ static int dedup_trim(uint64_t from, uint32_t len)
 int main(int argc, char *argv[])
 {
     (void) hash_index_insert;
-    (void) hash_index_lookup;
     (void) hash_index_remove;
     (void) hash_log_new;
     (void) hash_log_free;
