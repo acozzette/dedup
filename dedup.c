@@ -76,10 +76,11 @@ struct hash_log_entry {
 static int fd;
 static void *zeros;
 static uint64_t hash_log_free_list;
+static uint64_t data_log_free_list;
 
 static void usage()
 {
-    fprintf(stderr, "Usage: ./dedup /dev/nbd[0-9]\n");
+    fprintf(stderr, "Usage: ./dedup [-i | -n] /dev/nbd[0-9]\n");
 }
 
 static void print_debug_info()
@@ -190,7 +191,7 @@ static uint64_t hash_log_new()
 static int hash_log_free(uint64_t hash_log_address)
 {
     SEEK_TO_HASH_LOG(fd, hash_log_address);
-    int err = write(fd, &hash_log_address, sizeof(uint64_t));
+    int err = write(fd, &hash_log_free_list, sizeof(uint64_t));
     assert(err == sizeof(uint64_t));
     hash_log_free_list = hash_log_address;
 
@@ -199,12 +200,20 @@ static int hash_log_free(uint64_t hash_log_address)
 
 static uint64_t physical_block_new()
 {
-    return 0;
+    uint64_t new_block = data_log_free_list;
+    SEEK_TO_DATA_LOG(fd, new_block, 0);
+    int err = read(fd, &data_log_free_list, sizeof(uint64_t));
+    assert(err == sizeof(uint64_t));
+
+    return new_block;
 }
 
 static int physical_block_free(uint64_t pbn)
 {
-    (void) pbn;
+    SEEK_TO_DATA_LOG(fd, pbn, 0);
+    int err = write(fd, &data_log_free_list, sizeof(uint64_t));
+    assert(err == sizeof(uint64_t));
+    data_log_free_list = pbn;
 
     return 0;
 }
@@ -244,9 +253,26 @@ static int init()
     return 0;
 }
 
-static int decrement_refcount()
+static int decrement_refcount(char *fingerprint)
 {
-    /* FIXME */
+    struct hash_log_entry hle;
+    uint64_t hash_log_address = hash_index_lookup(fingerprint);
+    SEEK_TO_HASH_LOG(fd, hash_log_address);
+    int err = read(fd, &hle, sizeof(struct hash_log_entry));
+    assert(err == sizeof(struct hash_log_entry));
+
+    if (hle.ref_count > 1) {
+        hle.ref_count--;
+        SEEK_TO_HASH_LOG(fd, hash_log_address);
+        err = write(fd, &hle, sizeof(struct hash_log_entry));
+    } else {
+        /* The ref_count is now zero, so we need to do some garbage collection
+         * here. */
+        hash_index_remove(fingerprint);
+        physical_block_free(hle.pbn);
+        hash_log_free(hash_log_address);
+    }
+
     return 0;
 }
 
@@ -259,6 +285,8 @@ static int write_one_block(const void *buf, uint32_t len, uint64_t offset)
     int err;
     char fingerprint[FINGERPRINT_SIZE];
     uint64_t vbn = offset / BLOCK_SIZE;
+    uint64_t hash_log_address;
+    struct hash_log_entry new_entry;
 
     /* FIXME: Need to be able to handle sub-block extents, too. */
     assert(len == BLOCK_SIZE);
@@ -275,8 +303,37 @@ static int write_one_block(const void *buf, uint32_t len, uint64_t offset)
     /* ... more complicated logic needed here for when we deal with non-block
      * extents... */
 
-    /* Compute the fingerprint of the new block. */
-    SHA1(buf, BLOCK_SIZE, (unsigned char *) fingerprint);
+    /* Compute the fingerprint of the new block and update the block map. */
+    SHA1(buf, BLOCK_SIZE, (unsigned char *)fingerprint);
+    SEEK_TO_BLOCK_MAP(fd, vbn);
+    err = write(fd, fingerprint, FINGERPRINT_SIZE);
+    assert(err == FINGERPRINT_SIZE);
+
+    /* See if this fingerprint is already stored. */
+    hash_log_address = hash_index_lookup(fingerprint);
+    if (hash_log_address == (uint64_t) -1) {
+        /* This block is new. */
+        new_entry.pbn = physical_block_new();
+        new_entry.ref_count = 1;
+        hash_log_address = hash_log_new();
+        hash_index_insert(fingerprint, hash_log_address);
+        SEEK_TO_HASH_LOG(fd, hash_log_address);
+        err = write(fd, &new_entry, sizeof(struct hash_log_entry));
+        assert(err == sizeof(struct hash_log_entry));
+        SEEK_TO_DATA_LOG(fd, new_entry.pbn, offset % BLOCK_SIZE);
+        err = write(fd, buf, len);
+        assert(err == (int)len);
+    } else {
+        /* This block has already been stored. We just need to increment the
+         * refcount. */
+        SEEK_TO_HASH_LOG(fd, hash_log_address);
+        err = read(fd, &new_entry, sizeof(struct hash_log_entry));
+        assert(err == sizeof(struct hash_log_entry));
+        new_entry.ref_count += 1;
+        SEEK_TO_HASH_LOG(fd, hash_log_address);
+        err = write(fd, &new_entry, sizeof(struct hash_log_entry));
+        assert(err == sizeof(struct hash_log_entry));
+    }
 
     return 0;
 }
@@ -371,13 +428,27 @@ static int dedup_read(void *buf, uint32_t len, uint64_t offset)
     return 0;
 }
 
+/* Called upon receipt of a disconnect request. We need to make sure everything
+ * is written to stable storage before this function returns. */
 static int dedup_disc()
 {
+    int err;
+
+    fprintf(stderr, "Just received a disconnect request.\n");
+    SEEK_TO_HASH_LOG(fd, 0);
+    err = write(fd, &hash_log_free_list, sizeof(uint64_t));
+    assert(err == sizeof(uint64_t));
+
+    SEEK_TO_DATA_LOG(fd, 0, 0);
+    err = write(fd, &data_log_free_list, sizeof(uint64_t));
+    assert(err == sizeof(uint64_t));
+
     return 0;
 }
 
 static int dedup_flush()
 {
+    fprintf(stderr, "Just received a flush request.\n");
     return 0;
 }
 
@@ -390,22 +461,28 @@ static int dedup_trim(uint64_t from, uint32_t len)
 
 int main(int argc, char *argv[])
 {
-    (void) hash_index_insert;
-    (void) hash_index_remove;
-    (void) hash_log_new;
-    (void) hash_log_free;
     (void) print_debug_info;
-    (void) physical_block_new;
-    (void) physical_block_free;
 
     int err;
 
-    init();
+    if (argc != 3) {
+        usage();
+        return -1;
+    }
+
+    if (!strcmp(argv[1], "-i")) {
+        fprintf(stderr, "Performing initialization.\n");
+        init();
+        return 0;
+    }
 
     /* By convention the first entry in the hash log is a pointer to the hash
-     * log free list. */
+     * log free list. Likewise for the data log. */
     SEEK_TO_HASH_LOG(fd, 0);
     err = read(fd, &hash_log_free_list, sizeof(uint64_t));
+    assert(err == sizeof(uint64_t));
+    SEEK_TO_DATA_LOG(fd, 0, 0);
+    err = read(fd, &data_log_free_list, sizeof(uint64_t));
     assert(err == sizeof(uint64_t));
 
     struct buse_operations bop = {
@@ -415,11 +492,6 @@ int main(int argc, char *argv[])
         .flush = dedup_flush,
         .trim = dedup_trim
     };
-
-    if (argc != 2) {
-        usage();
-        return -1;
-    }
 
     buse_main(argc, argv, &bop, NULL);
 
