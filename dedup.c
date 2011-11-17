@@ -71,6 +71,9 @@ struct hash_log_entry {
     uint64_t ref_count;
 };
 
+/* Forward declaration */
+static int read_one_block(void *buf, uint32_t len, uint64_t offset);
+
 /* FIXME: BUSE should be modified to include a mechanism for storing state that
  * does not require global variables. */
 static int fd;
@@ -224,14 +227,6 @@ static int init()
     uint64_t i;
     int err;
 
-    fd = open(IMAGE, O_RDWR|O_LARGEFILE);
-    assert(fd != -1);
-
-    /* We mmap a bunch of zeros into memory. This way we can write it directly
-     * into the file to zero out the block map and hash index. */
-    zeros = mmap(NULL, BLOCK_MAP_SIZE + HASH_INDEX_SIZE, PROT_READ,
-            MAP_PRIVATE|MAP_ANONYMOUS, fd, 0);
-    assert(zeros != (void *)-1);
     err = write(fd, zeros, BLOCK_MAP_SIZE + HASH_INDEX_SIZE);
     assert(err == BLOCK_MAP_SIZE + HASH_INDEX_SIZE);
 
@@ -280,16 +275,13 @@ static int decrement_refcount(char *fingerprint)
  * physical) block. */
 static int write_one_block(const void *buf, uint32_t len, uint64_t offset)
 {
-    (void) buf;
-
     int err;
     char fingerprint[FINGERPRINT_SIZE];
     uint64_t vbn = offset / BLOCK_SIZE;
     uint64_t hash_log_address;
     struct hash_log_entry new_entry;
 
-    /* FIXME: Need to be able to handle sub-block extents, too. */
-    assert(len == BLOCK_SIZE);
+    assert((offset % BLOCK_SIZE)+ len <= BLOCK_SIZE);
 
     SEEK_TO_BLOCK_MAP(fd, vbn);
     err = read(fd, fingerprint, FINGERPRINT_SIZE);
@@ -300,11 +292,18 @@ static int write_one_block(const void *buf, uint32_t len, uint64_t offset)
         decrement_refcount(fingerprint);
     }
 
-    /* ... more complicated logic needed here for when we deal with non-block
-     * extents... */
+    if (len != BLOCK_SIZE) {
+        /* We need to read in the existing block and apply our changes to it so
+         * that we can determine the fingerprint. */
+        void *newbuf = malloc(BLOCK_SIZE);
+        read_one_block(newbuf, BLOCK_SIZE, 0);
+        memcpy((char *)newbuf + (offset % BLOCK_SIZE), buf, len);
+        SHA1(newbuf, BLOCK_SIZE, (unsigned char *)fingerprint);
+        free(newbuf);
+    } else
+        SHA1(buf, BLOCK_SIZE, (unsigned char *)fingerprint);
 
     /* Compute the fingerprint of the new block and update the block map. */
-    SHA1(buf, BLOCK_SIZE, (unsigned char *)fingerprint);
     SEEK_TO_BLOCK_MAP(fd, vbn);
     err = write(fd, fingerprint, FINGERPRINT_SIZE);
     assert(err == FINGERPRINT_SIZE);
@@ -381,7 +380,7 @@ static int read_one_block(void *buf, uint32_t len, uint64_t offset)
         /* Fill this virtual block with zeros. */
         dedup_write(zeros, BLOCK_SIZE, vbn);
         memset(buf, 0, len);
-        return len;
+        return 0;
     }
 
     /* Otherwise, we must look up the physical block corresponding to this
@@ -396,6 +395,7 @@ static int read_one_block(void *buf, uint32_t len, uint64_t offset)
 
     SEEK_TO_DATA_LOG(fd, h.pbn, offset % BLOCK_SIZE);
     err = read(fd, buf, len);
+    assert(err == (int)len);
 
     return 0;
 }
@@ -470,6 +470,15 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    fd = open(IMAGE, O_RDWR|O_LARGEFILE);
+    assert(fd != -1);
+
+    /* We mmap a bunch of zeros into memory. This way we can write it directly
+     * into the file to zero out the block map and hash index. */
+    zeros = mmap(NULL, BLOCK_MAP_SIZE + HASH_INDEX_SIZE, PROT_READ,
+            MAP_PRIVATE|MAP_ANONYMOUS, fd, 0);
+    assert(zeros != (void *)-1);
+
     if (!strcmp(argv[1], "-i")) {
         fprintf(stderr, "Performing initialization.\n");
         init();
@@ -490,7 +499,8 @@ int main(int argc, char *argv[])
         .write = dedup_write,
         .disc = dedup_disc,
         .flush = dedup_flush,
-        .trim = dedup_trim
+        .trim = dedup_trim,
+        .size = SIZE
     };
 
     buse_main(argc, argv, &bop, NULL);
