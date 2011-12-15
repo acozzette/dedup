@@ -68,7 +68,7 @@ typedef struct hash_index_entry hash_bucket[ENTRIES_PER_BUCKET];
 
 struct hash_log_entry {
     uint64_t pbn;
-    uint64_t ref_count;
+    uint32_t ref_count;
 };
 
 /* Forward declaration */
@@ -377,8 +377,6 @@ static int read_one_block(void *buf, uint32_t len, uint64_t offset)
     assert(err == FINGERPRINT_SIZE);
 
     if (fingerprint_is_zero(fingerprint)) {
-        /* Fill this virtual block with zeros. */
-        dedup_write(zeros, BLOCK_SIZE, vbn);
         memset(buf, 0, len);
         return 0;
     }
@@ -500,7 +498,7 @@ int main(int argc, char *argv[])
         .disc = dedup_disc,
         .flush = dedup_flush,
         .trim = dedup_trim,
-        .size = SIZE
+        .size = NVIRT_BLOCKS * 4096,
     };
 
     buse_main(argc, argv, &bop, NULL);
