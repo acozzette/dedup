@@ -57,6 +57,12 @@
             (i)*BLOCK_SIZE + j, SEEK_SET); \
     } while(0)
 
+/* The size of the fingerprint cache, described in terms of how many bits are
+ * used to determine the location of a cache line. Here, we use the first 20
+ * bits of the fingerprint, which allows us to store 1M entries, each 32B, for a
+ * total cache that uses 32 MB of memory. */
+#define CACHE_SIZE 20
+
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
 struct hash_index_entry {
@@ -67,8 +73,9 @@ struct hash_index_entry {
 typedef struct hash_index_entry hash_bucket[ENTRIES_PER_BUCKET];
 
 struct hash_log_entry {
-    uint64_t pbn;
+    char fingerprint[FINGERPRINT_SIZE];
     uint32_t ref_count;
+    uint64_t pbn;
 };
 
 /* Forward declaration */
@@ -78,6 +85,7 @@ static int read_one_block(void *buf, uint32_t len, uint64_t offset);
  * does not require global variables. */
 static int fd;
 static void *zeros;
+static struct hash_log_entry *cache;
 static uint64_t hash_log_free_list;
 static uint64_t data_log_free_list;
 
@@ -248,6 +256,54 @@ static int init()
     return 0;
 }
 
+/* Given a fingerprint, return the index where it can (potentially) be found in
+ * the cache. */
+static u_int32_t get_cache_index(char *fingerprint)
+{
+    /* It doesn't actually matter which bits we choose, as long as we are
+     * consistent. So let's treat the first four bytes as an integer and take
+     * the lower bits of that. */
+    u_int32_t mask = (1 << CACHE_SIZE) - 1;
+    u_int32_t result = ((u_int32_t *)fingerprint)[0] & mask;
+    assert(result < mask);
+    return result;
+}
+
+static struct hash_log_entry lookup_fingerprint(char *fingerprint)
+{
+    int err;
+
+    u_int32_t index = get_cache_index(fingerprint);
+    if (!memcmp(fingerprint, cache[index].fingerprint, FINGERPRINT_SIZE)) {
+        /* Awesome, this fingerprint is already cached, so we are good to go. */
+        return cache[index];
+    }
+
+    /* Otherwise we have to look on disk. */
+    uint64_t hash_log_address = hash_index_lookup(fingerprint);
+    assert(hash_log_address != (uint64_t)-1);
+
+    /* Now let's look up everything in the 4K block containing the hash log
+     * entry we want. This way we can cache it all for later. */
+    hash_log_address = hash_log_address % BLOCK_SIZE;
+    SEEK_TO_HASH_LOG(fd, hash_log_address);
+    struct hash_log_entry h;
+
+    for (unsigned i = 0; i < BLOCK_SIZE/sizeof(struct hash_log_entry); i++) {
+        err = read(fd, &h, sizeof(struct hash_log_entry));
+        assert(err == sizeof(struct hash_log_entry));
+
+        u_int32_t j = get_cache_index(h.fingerprint);
+        memcpy(cache + j, &h, FINGERPRINT_SIZE);
+    }
+
+    /* Now we should have looked up the fingerprint we wanted, along with a
+     * bunch of others. */
+    assert(!memcmp(fingerprint, cache[index].fingerprint, FINGERPRINT_SIZE));
+
+    return cache[index];
+}
+
 static int decrement_refcount(char *fingerprint)
 {
     struct hash_log_entry hle;
@@ -383,13 +439,7 @@ static int read_one_block(void *buf, uint32_t len, uint64_t offset)
 
     /* Otherwise, we must look up the physical block corresponding to this
      * virtual block. */
-    uint64_t hash_log_address = hash_index_lookup(fingerprint);
-    assert(hash_log_address != (uint64_t)-1);
-
-    SEEK_TO_HASH_LOG(fd, hash_log_address);
-    struct hash_log_entry h;
-    err = read(fd, &h, sizeof(struct hash_log_entry));
-    assert(err == sizeof(struct hash_log_entry));
+    struct hash_log_entry h = lookup_fingerprint(fingerprint);
 
     SEEK_TO_DATA_LOG(fd, h.pbn, offset % BLOCK_SIZE);
     err = read(fd, buf, len);
@@ -501,7 +551,9 @@ int main(int argc, char *argv[])
         .size = NVIRT_BLOCKS * 4096,
     };
 
+    cache = calloc(1 << CACHE_SIZE, sizeof(struct hash_log_entry));
     buse_main(argc, argv, &bop, NULL);
+    free(cache);
 
     return 0;
 }
